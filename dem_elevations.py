@@ -19,9 +19,18 @@ Tile sources (no authentication required):
   ALOS    : AW3D30 GeoTIFFs mirrored by OpenTopography
   NASADEM : NASADEM_be GeoTIFFs mirrored by OpenTopography
 
+With --sampling-distance D (meters), each DEM is instead searched for its
+highest pixel within D meters of the input point (spanning into neighboring
+tiles when the radius crosses a tile edge), and the latitude/longitude of that
+highest pixel are added to the output. This compensates for GNSS points that
+are slightly off the true summit. Values are then raw pixel maxima, so
+--interpolation does not apply, and the GLO-30 EDM/FLM/HEM masks are sampled
+at GLO-30's highest pixel rather than at the input point.
+
 Usage:
   python dem_elevations.py "input.csv" [-o out.csv] [--cache-dir dem_cache]
                            [-j 8] [--interpolation bilinear|nearest] [--limit N]
+                           [--sampling-distance D]
 """
 
 import argparse
@@ -83,6 +92,30 @@ def _lon_label(v, width=3):
 def tile_origin(lat, lon):
     """SW corner of the 1x1 degree tile containing the point."""
     return math.floor(lat), math.floor(lon)
+
+
+# Meters per degree of latitude (and of longitude at the equator); close
+# enough for computing a search bounding box, which is then refined by exact
+# per-pixel distances.
+M_PER_DEG = 111320.0
+
+
+def search_bbox(lat, lon, radius):
+    """(dlat, dlon) half-extents in degrees of a box covering `radius` m."""
+    dlat = radius / M_PER_DEG
+    dlon = min(radius / max(M_PER_DEG * math.cos(math.radians(lat)), 1e-6), 180.0)
+    return dlat, dlon
+
+
+def tiles_for_point(lat, lon, radius):
+    """Origins of every 1x1 degree tile within `radius` m of the point."""
+    if radius <= 0:
+        return {tile_origin(lat, lon)}
+    dlat, dlon = search_bbox(lat, lon, radius)
+    return {(la, (lo + 180) % 360 - 180)  # normalize across the antimeridian
+            for la in range(math.floor(lat - dlat), math.floor(lat + dlat) + 1)
+            for lo in range(math.floor(lon - dlon), math.floor(lon + dlon) + 1)
+            if -90 <= la <= 89}
 
 
 def glo30_name(lat0, lon0):
@@ -244,11 +277,13 @@ def _fetch_task(task):
         return task, None, f"{type(e).__name__}: {e}"
 
 
-def fetch_all_tiles(cache, points, workers, extra=()):
+def fetch_all_tiles(cache, points, workers, extra=(), radius=0):
     """Download every unique tile needed by `points` (list of (lat, lon))."""
     layers = list(DEM_NAMES) + list(extra)
-    tasks = sorted({(dem, *tile_origin(lat, lon))
-                    for lat, lon in points for dem in layers})
+    tasks = sorted({(dem, *origin)
+                    for lat, lon in points
+                    for origin in tiles_for_point(lat, lon, radius)
+                    for dem in layers})
     print(f"{len(tasks)} unique tiles needed for {len(points)} points")
     failures = []
 
@@ -294,6 +329,46 @@ def sample(dataset, lat, lon, interpolation):
     return float(val)
 
 
+def max_in_dataset(dataset, lat, lon, radius):
+    """Highest pixel within `radius` m of (lat, lon) in one dataset.
+
+    Returns (value, pixel_lat, pixel_lon) or None. Distances are haversine to
+    pixel centers, so the search area is a true circle, not the bounding box.
+    """
+    import numpy as np
+    t = dataset.transform
+    # Shift the query longitude into the tile's frame (antimeridian case)
+    if lon - t.c > 180:
+        lon -= 360
+    elif t.c - lon > 180:
+        lon += 360
+    dlat, dlon = search_bbox(lat, lon, radius)
+    c0f, r0f = ~t * (lon - dlon, lat + dlat)
+    c1f, r1f = ~t * (lon + dlon, lat - dlat)
+    c0 = max(0, math.floor(min(c0f, c1f)))
+    c1 = min(dataset.width, math.ceil(max(c0f, c1f)))
+    r0 = max(0, math.floor(min(r0f, r1f)))
+    r1 = min(dataset.height, math.ceil(max(r0f, r1f)))
+    if c0 >= c1 or r0 >= r1:
+        return None
+    block = dataset.read(1, window=((r0, r1), (c0, c1)), masked=True)
+    lons = t.c + (np.arange(c0, c1) + 0.5) * t.a
+    lats = t.f + (np.arange(r0, r1) + 0.5) * t.e
+    latg, long = np.deg2rad(np.meshgrid(lats, lons, indexing="ij"))
+    la, lo = math.radians(lat), math.radians(lon)
+    h = (np.sin((latg - la) / 2) ** 2
+         + math.cos(la) * np.cos(latg) * np.sin((long - lo) / 2) ** 2)
+    dist = 2 * 6371000.0 * np.arcsin(np.sqrt(h))
+    vals = block.astype("float64").filled(-np.inf)
+    vals[~np.isfinite(vals) | (dist > radius)] = -np.inf
+    idx = np.unravel_index(np.argmax(vals), vals.shape)
+    if not np.isfinite(vals[idx]):
+        return None
+    plon = float(np.rad2deg(long[idx]))
+    return (float(vals[idx]),
+            float(np.rad2deg(latg[idx])), (plon + 180) % 360 - 180)
+
+
 class TileSampler:
     def __init__(self, cache, interpolation, geoid=True):
         self.cache = cache
@@ -301,12 +376,15 @@ class TileSampler:
         self.geoid = geoid
         self.datasets = {}  # path -> open dataset
 
-    def _sample_path(self, path, lat, lon, interpolation):
+    def _open(self, path):
         import rasterio
         key = str(path)
         if key not in self.datasets:
             self.datasets[key] = rasterio.open(path)
-        return sample(self.datasets[key], lat, lon, interpolation)
+        return self.datasets[key]
+
+    def _sample_path(self, path, lat, lon, interpolation):
+        return sample(self._open(path), lat, lon, interpolation)
 
     def undulation(self, dem, lat, lon):
         """Geoid height N for this DEM's vertical datum (always bilinear —
@@ -324,6 +402,26 @@ class TileSampler:
         if val is not None and self.geoid:
             val += self.undulation(dem, lat, lon)
         return val
+
+    def highest(self, dem, lat, lon, radius):
+        """Highest DEM pixel within `radius` m of the point, across tiles.
+
+        Returns (elevation, pixel_lat, pixel_lon) or None.
+        """
+        best = None
+        for lat0, lon0 in sorted(tiles_for_point(lat, lon, radius)):
+            path = ENSURE[dem](self.cache, lat0, lon0)
+            if path is None:
+                continue
+            found = max_in_dataset(self._open(path), lat, lon, radius)
+            if found and (best is None or found[0] > best[0]):
+                best = found
+        if best is None:
+            return None
+        val, plat, plon = best
+        if self.geoid:
+            val += self.undulation(dem, plat, plon)
+        return val, plat, plon
 
     def mask_info(self, lat, lon):
         """GLO-30 provenance at the point: [EDM label, FLM label, HEM str]."""
@@ -381,7 +479,14 @@ def main():
                     help="skip the GLO-30 EDM/FLM/HEM provenance columns")
     ap.add_argument("--limit", type=int,
                     help="only process the first N data rows (for testing)")
+    ap.add_argument("--sampling-distance", type=float, default=0.0,
+                    metavar="METERS",
+                    help="report the highest DEM sample within this distance "
+                         "of each point, plus its lat/long, searching "
+                         "neighboring tiles as needed (default: 0 = sample "
+                         "exactly at the point)")
     args = ap.parse_args()
+    radius = args.sampling_distance
 
     cache = Path(args.cache_dir)
     out_path = args.output or str(Path(args.csv).with_suffix("")) + "_dem_elevations.csv"
@@ -392,12 +497,22 @@ def main():
     header = rows[hdr_i]
     lat_col, lon_col = cols["lat"], cols["long"]
     dem_cols = {}
+    pos_cols = {}  # dem -> (lat col, long col) of its highest sample
     for dem in DEM_NAMES:
         if dem.lower() in cols:
             dem_cols[dem] = cols[dem.lower()]
         else:
             header.append(dem)
             dem_cols[dem] = len(header) - 1
+        if radius > 0:
+            pair = []
+            for h in (f"{dem} Lat", f"{dem} Long"):
+                if h.lower() in cols:
+                    pair.append(cols[h.lower()])
+                else:
+                    header.append(h)
+                    pair.append(len(header) - 1)
+            pos_cols[dem] = tuple(pair)
     mask_cols = []
     if not args.no_masks:
         for h in MASK_HEADERS:
@@ -418,44 +533,61 @@ def main():
 
     failures = fetch_all_tiles(cache, [(la, lo) for _, la, lo in data],
                                args.workers,
-                               extra=() if args.no_masks else AUX_KINDS)
+                               extra=() if args.no_masks else AUX_KINDS,
+                               radius=radius)
     if failures:
         print(f"warning: {len(failures)} tile downloads failed; "
               "their points will be left blank", file=sys.stderr)
 
     if not args.no_geoid:
         for model in sorted(set(DEM_GEOID.values())):
-            print(f"fetching geoid grid: {GEOID_URLS[model].rsplit('/', 1)[1]}",
+            name = GEOID_URLS[model].rsplit("/", 1)[1]
+            cached = (cache / "geoid" / name).exists()
+            print(f"geoid grid {name}: {'cached' if cached else 'downloading'}",
                   flush=True)
             if ensure_geoid(cache, model) is None:
                 sys.exit(f"error: geoid grid {model} not found on cdn.proj.org")
 
     sampler = TileSampler(cache, args.interpolation, geoid=not args.no_geoid)
     try:
+        def put(row, col, v):
+            while len(row) <= col:
+                row.append("")
+            row[col] = v
+
         for n, (i, lat, lon) in enumerate(data, 1):
             row = rows[i]
+            mask_pt = (lat, lon)  # where to sample the GLO-30 masks
             for dem in DEM_NAMES:
-                col = dem_cols[dem]
-                while len(row) <= col:
-                    row.append("")
+                elev, pos = None, None
                 try:
-                    elev = sampler.elevation(dem, lat, lon)
+                    if radius > 0:
+                        found = sampler.highest(dem, lat, lon, radius)
+                        if found:
+                            elev, plat, plon = found
+                            pos = (plat, plon)
+                            if dem == "GLO-30":
+                                mask_pt = pos
+                    else:
+                        elev = sampler.elevation(dem, lat, lon)
                 except Exception as e:
                     print(f"row {i + 1} {dem}: {type(e).__name__}: {e}",
                           file=sys.stderr)
-                    elev = ""
-                row[col] = f"{elev:.2f}" if isinstance(elev, float) else ""
+                put(row, dem_cols[dem],
+                    f"{elev:.2f}" if isinstance(elev, float) else "")
+                if radius > 0:
+                    lat_col_o, lon_col_o = pos_cols[dem]
+                    put(row, lat_col_o, f"{pos[0]:.6f}" if pos else "")
+                    put(row, lon_col_o, f"{pos[1]:.6f}" if pos else "")
             if mask_cols:
                 try:
-                    values = sampler.mask_info(lat, lon)
+                    values = sampler.mask_info(*mask_pt)
                 except Exception as e:
                     print(f"row {i + 1} masks: {type(e).__name__}: {e}",
                           file=sys.stderr)
                     values = ["", "", ""]
                 for col, v in zip(mask_cols, values):
-                    while len(row) <= col:
-                        row.append("")
-                    row[col] = v
+                    put(row, col, v)
             if n % 50 == 0 or n == len(data):
                 print(f"sampled {n}/{len(data)}", flush=True)
     finally:

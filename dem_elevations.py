@@ -373,7 +373,7 @@ def main():
     ap.add_argument("-j", "--workers", type=int, default=1,
                     help="parallel download processes (default: 1 = serial)")
     ap.add_argument("--interpolation", choices=["bilinear", "nearest"],
-                    default="bilinear", help="sampling method (default: bilinear)")
+                    default="nearest", help="sampling method (default: nearest)")
     ap.add_argument("--no-geoid", action="store_true",
                     help="report raw orthometric DEM values instead of adding "
                          "the geoid undulation to get ellipsoidal heights")

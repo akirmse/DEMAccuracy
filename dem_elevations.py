@@ -26,6 +26,7 @@ Usage:
 
 import argparse
 import csv
+import functools
 import math
 import multiprocessing
 import os
@@ -49,6 +50,24 @@ GEOID_URLS = {
 }
 DEM_GEOID = {"GLO-30": "egm2008", "FABDEM": "egm2008",
              "ALOS": "egm96", "NASADEM": "egm96"}
+
+# GLO-30 auxiliary masks (per-pixel provenance), decoded per the Copernicus
+# DEM Product Handbook. HEM is the interferometric height error in meters --
+# note it reflects relative precision only and is blind to absolute errors
+# such as phase-unwrapping busts on isolated plateaus.
+AUX_KINDS = ("EDM", "FLM", "HEM")
+EDM_LEGEND = {
+    0: "void", 1: "not edited", 2: "infill of external DEM",
+    3: "interpolated", 4: "smoothed", 5: "airport editing",
+    6: "raised negative elevation", 7: "flattened", 8: "ocean", 9: "lake",
+    10: "river", 11: "shoreline", 12: "morphological editing", 13: "shifted",
+}
+FLM_LEGEND = {
+    0: "void", 1: "edited (see EDM)", 2: "not edited/filled", 3: "ASTER",
+    4: "SRTM90", 5: "SRTM30", 6: "GMTED2010", 7: "SRTM30plus",
+    8: "TerraSAR-X radargrammetric DEM", 9: "AW3D30", 10: "national DEM",
+}
+MASK_HEADERS = ["GLO-30 EDM", "GLO-30 FLM", "GLO-30 HEM (m)"]
 
 
 # ---------------------------------------------------------------- tile naming
@@ -195,6 +214,17 @@ def ensure_geoid(cache, model):
     return download(url, cache / "geoid" / url.rsplit("/", 1)[1])
 
 
+def _ensure_glo30_aux(kind, cache, lat0, lon0):
+    name = glo30_name(lat0, lon0)          # ..._DEM
+    stem = name[: -len("_DEM")]
+    # NB: not "aux" -- that is a reserved device name on Windows
+    return download(f"{GLO30_BASE}/{name}/AUXFILES/{stem}_{kind}.tif",
+                    cache / "glo30" / "masks" / f"{stem}_{kind}.tif")
+
+
+ENSURE.update({k: functools.partial(_ensure_glo30_aux, k) for k in AUX_KINDS})
+
+
 # ------------------------------------------------------- parallel tile fetch
 
 _worker_cache = None
@@ -214,10 +244,11 @@ def _fetch_task(task):
         return task, None, f"{type(e).__name__}: {e}"
 
 
-def fetch_all_tiles(cache, points, workers):
+def fetch_all_tiles(cache, points, workers, extra=()):
     """Download every unique tile needed by `points` (list of (lat, lon))."""
+    layers = list(DEM_NAMES) + list(extra)
     tasks = sorted({(dem, *tile_origin(lat, lon))
-                    for lat, lon in points for dem in DEM_NAMES})
+                    for lat, lon in points for dem in layers})
     print(f"{len(tasks)} unique tiles needed for {len(points)} points")
     failures = []
 
@@ -294,6 +325,21 @@ class TileSampler:
             val += self.undulation(dem, lat, lon)
         return val
 
+    def mask_info(self, lat, lon):
+        """GLO-30 provenance at the point: [EDM label, FLM label, HEM str]."""
+        out = []
+        for kind in AUX_KINDS:
+            path = ENSURE[kind](self.cache, *tile_origin(lat, lon))
+            v = (self._sample_path(path, lat, lon, "nearest")
+                 if path is not None else None)
+            if kind == "HEM":
+                # HEM nodata is -32767 (may not be declared in the tif)
+                out.append("" if v is None or v < -32000 else f"{v:.2f}")
+            else:
+                legend = EDM_LEGEND if kind == "EDM" else FLM_LEGEND
+                out.append("" if v is None else legend.get(int(v), str(int(v))))
+        return out
+
     def close(self):
         for ds in self.datasets.values():
             ds.close()
@@ -331,6 +377,8 @@ def main():
     ap.add_argument("--no-geoid", action="store_true",
                     help="report raw orthometric DEM values instead of adding "
                          "the geoid undulation to get ellipsoidal heights")
+    ap.add_argument("--no-masks", action="store_true",
+                    help="skip the GLO-30 EDM/FLM/HEM provenance columns")
     ap.add_argument("--limit", type=int,
                     help="only process the first N data rows (for testing)")
     args = ap.parse_args()
@@ -350,6 +398,14 @@ def main():
         else:
             header.append(dem)
             dem_cols[dem] = len(header) - 1
+    mask_cols = []
+    if not args.no_masks:
+        for h in MASK_HEADERS:
+            if h.lower() in cols:
+                mask_cols.append(cols[h.lower()])
+            else:
+                header.append(h)
+                mask_cols.append(len(header) - 1)
 
     data = []  # (row_index, lat, lon)
     for i in range(hdr_i + 1, len(rows)):
@@ -360,7 +416,9 @@ def main():
         data = data[:args.limit]
     print(f"{len(data)} points to process")
 
-    failures = fetch_all_tiles(cache, [(la, lo) for _, la, lo in data], args.workers)
+    failures = fetch_all_tiles(cache, [(la, lo) for _, la, lo in data],
+                               args.workers,
+                               extra=() if args.no_masks else AUX_KINDS)
     if failures:
         print(f"warning: {len(failures)} tile downloads failed; "
               "their points will be left blank", file=sys.stderr)
@@ -387,6 +445,17 @@ def main():
                           file=sys.stderr)
                     elev = ""
                 row[col] = f"{elev:.2f}" if isinstance(elev, float) else ""
+            if mask_cols:
+                try:
+                    values = sampler.mask_info(lat, lon)
+                except Exception as e:
+                    print(f"row {i + 1} masks: {type(e).__name__}: {e}",
+                          file=sys.stderr)
+                    values = ["", "", ""]
+                for col, v in zip(mask_cols, values):
+                    while len(row) <= col:
+                        row.append("")
+                    row[col] = v
             if n % 50 == 0 or n == len(data):
                 print(f"sampled {n}/{len(data)}", flush=True)
     finally:

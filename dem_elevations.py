@@ -11,7 +11,7 @@ each DEM is referenced to (EGM2008 for GLO-30/FABDEM, EGM96 for ALOS/NASADEM).
 The undulation grids are the official GeoTIFFs from cdn.proj.org, cached like
 the DEM tiles. Use --no-geoid for raw orthometric DEM values.
 
-Tile sources (no authentication required):
+Tile sources (no authentication required unless noted):
   GLO-30  : Copernicus DEM GLO-30 COGs on AWS S3
   FABDEM  : University of Bristol V1-2. Distributed as 10x10 degree zips of
             1+ GB; only the needed 1-degree tile is extracted, via HTTP range
@@ -19,13 +19,25 @@ Tile sources (no authentication required):
   ALOS    : AW3D30 GeoTIFFs mirrored by OpenTopography
   NASADEM : NASADEM_be GeoTIFFs mirrored by OpenTopography
 
+Per-pixel provenance columns (skip with --no-masks):
+  GLO-30  : EDM (editing), FLM (fill source), HEM (interferometric height
+            error, m), from the AUXFILES next to each AWS COG
+  ALOS    : MSK (validity + void-fill source), STK (PRISM scene stack count),
+            extracted from JAXA's release_v2012 zips -- the same v3.2 data
+            the OpenTopography DSM mirror carries
+  NASADEM : NUM (elevation source / scene count). Only available inside
+            Earthdata-authenticated granule zips: set $EARTHDATA_TOKEN (or
+            --earthdata-token, or urs.earthdata.nasa.gov in ~/.netrc), else
+            the column is left blank. Tokens: https://urs.earthdata.nasa.gov
+            -> profile -> Generate Token.
+
 With --sampling-distance D (meters), each DEM is instead searched for its
 highest pixel within D meters of the input point (spanning into neighboring
 tiles when the radius crosses a tile edge), and the latitude/longitude of that
 highest pixel are added to the output. This compensates for GNSS points that
 are slightly off the true summit. Values are then raw pixel maxima, so
---interpolation does not apply, and the GLO-30 EDM/FLM/HEM masks are sampled
-at GLO-30's highest pixel rather than at the input point.
+--interpolation does not apply, and each DEM's provenance layers are sampled
+at that DEM's highest pixel rather than at the input point.
 
 Usage:
   python dem_elevations.py "input.csv" [-o out.csv] [--cache-dir dem_cache]
@@ -36,13 +48,20 @@ Usage:
 import argparse
 import csv
 import functools
+import io
 import math
 import multiprocessing
+import netrc
 import os
 import sys
+import zipfile
 from pathlib import Path
 
+import numpy as np
+import rasterio
 import requests
+from rasterio.transform import from_origin
+from remotezip import RemoteZip
 from requests.adapters import HTTPAdapter, Retry
 
 DEM_NAMES = ["GLO-30", "FABDEM", "ALOS", "NASADEM"]
@@ -64,7 +83,6 @@ DEM_GEOID = {"GLO-30": "egm2008", "FABDEM": "egm2008",
 # DEM Product Handbook. HEM is the interferometric height error in meters --
 # note it reflects relative precision only and is blind to absolute errors
 # such as phase-unwrapping busts on isolated plateaus.
-AUX_KINDS = ("EDM", "FLM", "HEM")
 EDM_LEGEND = {
     0: "void", 1: "not edited", 2: "infill of external DEM",
     3: "interpolated", 4: "smoothed", 5: "airport editing",
@@ -76,7 +94,78 @@ FLM_LEGEND = {
     4: "SRTM90", 5: "SRTM30", 6: "GMTED2010", 7: "SRTM30plus",
     8: "TerraSAR-X radargrammetric DEM", 9: "AW3D30", 10: "national DEM",
 }
-MASK_HEADERS = ["GLO-30 EDM", "GLO-30 FLM", "GLO-30 HEM (m)"]
+
+# ALOS AW3D30 MSK, decoded per the AW3D30 v3.2 Product Description: the low
+# 2 bits are the validity mask, the upper 6 bits the void-fill source.
+# MSK/STK come from JAXA's release_v2012 (v3.2) zips, which carry the exact
+# DSM that the OpenTopography mirror serves (verified bit-identical).
+ALOS_AUX_BASE = "https://www.eorc.jaxa.jp/ALOS/aw3d30/data/release_v2012"
+MSK_MASK_LEGEND = {0: "valid", 1: "cloud/snow (invalid)",
+                   2: "land water/low correlation", 3: "sea"}
+MSK_FILL_LEGEND = {0x04: "GSI DTM", 0x08: "SRTM-1 v3", 0x0C: "PRISM DSM",
+                   0x10: "ViewFinder Panoramas", 0x18: "ASTER GDEM v2",
+                   0x1C: "ArcticDEM v2", 0x20: "TanDEM-X 90m",
+                   0x24: "ArcticDEM v3", 0x28: "ASTER GDEM v3",
+                   0x2C: "REMA v1.1"}
+
+# NASADEM NUM (per-pixel elevation source), per the NASADEM User Guide
+# Table 2. Only distributed inside Earthdata-authenticated granule zips.
+NASADEM_ZIP_BASE = ("https://data.lpdaac.earthdatacloud.nasa.gov/"
+                    "lp-prod-protected/NASADEM_HGT.001")
+EARTHDATA_TOKEN_VAR = "EARTHDATA_TOKEN"
+NUM_SPECIAL = {231: "SRTMv3 from GDEM3", 232: "SRTMv2 from GDEM3",
+               233: "SRTMv2 from GDEM2", 234: "SRTM-with-NGA-fill from GDEM2",
+               241: "NED from GDEM2", 242: "NED from GDEM3",
+               243: "CDED from GDEM2", 244: "CDED from GDEM3",
+               245: "Alaska from GDEM2", 246: "Alaska from GDEM3",
+               250: "interpolation", 251: "quad edge averaged", 255: "error"}
+
+
+def _fmt_legend(legend):
+    return lambda v: legend.get(int(v), str(int(v)))
+
+
+def _fmt_hem(v):
+    # HEM nodata is -32767 (may not be declared in the tif)
+    return "" if v < -32000 else f"{v:.2f}"
+
+
+def _fmt_msk(v):
+    v = int(v)
+    if v == 0xFC:
+        return "IDW fill"
+    label = MSK_MASK_LEGEND.get(v & 3, str(v & 3))
+    fill = v & 0xFC
+    if fill:
+        label += ", filled: " + MSK_FILL_LEGEND.get(fill, hex(fill))
+    return label
+
+
+def _fmt_num(v):
+    v = int(v)
+    if v == 0:
+        return "water"
+    if 1 <= v <= 23:
+        return f"SRTM ({v} scenes)"
+    if 41 <= v <= 94:
+        return f"PRISM ({v - 40} scenes)"
+    if 110 <= v <= 160:
+        return f"GDEM3 ({v - 110} scenes)"
+    if 170 <= v <= 220:
+        return f"GDEM2 ({v - 170} scenes)"
+    return NUM_SPECIAL.get(v, str(v))
+
+
+# dem -> [(layer key in ENSURE, output column header, value formatter)]
+PROVENANCE = {
+    "GLO-30": [("EDM", "GLO-30 EDM", _fmt_legend(EDM_LEGEND)),
+               ("FLM", "GLO-30 FLM", _fmt_legend(FLM_LEGEND)),
+               ("HEM", "GLO-30 HEM (m)", _fmt_hem)],
+    "ALOS": [("MSK", "ALOS MSK", _fmt_msk),
+             ("STK", "ALOS STK", lambda v: str(int(v)))],
+    "NASADEM": [("NUM", "NASADEM NUM", _fmt_num)],
+}
+AUX_KINDS = tuple(k for specs in PROVENANCE.values() for k, _, _ in specs)
 
 
 # ---------------------------------------------------------------- tile naming
@@ -202,40 +291,134 @@ def ensure_nasadem(cache, lat0, lon0):
     return download(f"{NASADEM_BASE}/{name}", cache / "nasadem" / name)
 
 
-def ensure_fabdem(cache, lat0, lon0):
-    """Get a FABDEM 1-degree tile.
+def extract_remote_zip(url, member, dest):
+    """Extract one member of a remote zip to dest via HTTP range requests
+    (remotezip), so only the needed slice of the archive is transferred.
 
-    FABDEM ships as 10x10 degree zips of 1+ GB; rather than download the whole
-    zip, extract just the needed tile with HTTP range requests (remotezip).
+    Returns dest, or None (remembered with a .missing marker) when the zip
+    or the member does not exist (ocean blocks).
     """
-    from remotezip import RemoteZip
-    tif = cache / "fabdem" / fabdem_tile_name(lat0, lon0)
-    missing = tif.with_suffix(tif.suffix + ".missing")
-    if tif.exists():
-        return tif
+    dest = Path(dest)
+    missing = dest.with_suffix(dest.suffix + ".missing")
+    if dest.exists():
+        return dest
     if missing.exists():
         return None
-    tif.parent.mkdir(parents=True, exist_ok=True)
-    url = f"{FABDEM_BASE}/{fabdem_zip_name(lat0, lon0)}"
+    dest.parent.mkdir(parents=True, exist_ok=True)
     if get_session().head(url, timeout=30).status_code == 404:
         missing.touch()  # whole block is ocean
         return None
     with RemoteZip(url) as zf:
-        if tif.name not in zf.namelist():
+        if member not in zf.namelist():
             missing.touch()  # tile absent inside the block (ocean)
             return None
-        tmp = tif.with_suffix(tif.suffix + f".part{os.getpid()}")
+        tmp = dest.with_suffix(dest.suffix + f".part{os.getpid()}")
         try:
-            with zf.open(tif.name) as src, open(tmp, "wb") as out:
+            with zf.open(member) as src, open(tmp, "wb") as out:
                 while True:
                     buf = src.read(1 << 20)
                     if not buf:
                         break
                     out.write(buf)
-            os.replace(tmp, tif)
+            os.replace(tmp, dest)
         finally:
             tmp.unlink(missing_ok=True)
-    return tif
+    return dest
+
+
+def ensure_fabdem(cache, lat0, lon0):
+    """Get a FABDEM 1-degree tile (from 10x10 degree zips of 1+ GB)."""
+    name = fabdem_tile_name(lat0, lon0)
+    return extract_remote_zip(f"{FABDEM_BASE}/{fabdem_zip_name(lat0, lon0)}",
+                              name, cache / "fabdem" / name)
+
+
+def alos_block(lat0, lon0):
+    """5x5 degree JAXA distribution block, e.g. N005W065_N010W060."""
+    blat = math.floor(lat0 / 5) * 5
+    blon = math.floor(lon0 / 5) * 5
+    return (f"{_lat_label(blat, 3)}{_lon_label(blon)}_"
+            f"{_lat_label(blat + 5, 3)}{_lon_label(blon + 5)}")
+
+
+def _ensure_alos_aux(kind, cache, lat0, lon0):
+    """ALOS MSK/STK tile from JAXA's v3.2 release zips."""
+    name = alos_name(lat0, lon0).replace("_DSM.tif", f"_{kind}.tif")
+    block = alos_block(lat0, lon0)
+    return extract_remote_zip(f"{ALOS_AUX_BASE}/{block}.zip",
+                              f"{block}/{name}",
+                              cache / "alos" / "masks" / name)
+
+
+def have_earthdata_creds():
+    """True if an Earthdata bearer token or urs.earthdata.nasa.gov netrc
+    entry is available for NASADEM NUM downloads."""
+    if os.environ.get(EARTHDATA_TOKEN_VAR):
+        return True
+    for name in (".netrc", "_netrc"):
+        try:
+            auth = netrc.netrc(Path.home() / name)
+            if auth.authenticators("urs.earthdata.nasa.gov"):
+                return True
+        except (OSError, netrc.NetrcParseError):
+            pass
+    return False
+
+
+def ensure_nasadem_num(cache, lat0, lon0):
+    """NASADEM NUM (per-pixel elevation source) tile from LP DAAC.
+
+    NUM is only distributed inside the Earthdata-authenticated NASADEM_HGT
+    granule zips, as a raw big-endian byte grid. The zip is downloaded (with
+    the EARTHDATA_TOKEN bearer token or ~/.netrc credentials), the .num
+    member converted to a compressed GeoTIFF, and the zip discarded. Without
+    credentials, returns None so the NUM column is left blank.
+    """
+    tile = f"{_lat_label(lat0).lower()}{_lon_label(lon0).lower()}"
+    dest = cache / "nasadem" / "masks" / f"NASADEM_NUM_{tile}.tif"
+    missing = dest.with_suffix(dest.suffix + ".missing")
+    if dest.exists():
+        return dest
+    if missing.exists() or not have_earthdata_creds():
+        return None
+    token = os.environ.get(EARTHDATA_TOKEN_VAR)
+    headers = {"Authorization": f"Bearer {token}"} if token else None
+    url = f"{NASADEM_ZIP_BASE}/NASADEM_HGT_{tile}/NASADEM_HGT_{tile}.zip"
+    r = get_session().get(url, headers=headers, timeout=(30, 300))
+    if r.status_code == 404:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        missing.touch()  # ocean or outside SRTM coverage
+        return None
+    r.raise_for_status()
+    if not r.content.startswith(b"PK"):  # got a login page, not a zip
+        raise RuntimeError(
+            "Earthdata authentication failed for NASADEM NUM; check "
+            f"${EARTHDATA_TOKEN_VAR} or the urs.earthdata.nasa.gov entry "
+            "in ~/.netrc")
+    with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
+        member = next((n for n in zf.namelist() if n.endswith(".num")), None)
+        if member is None:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            missing.touch()
+            return None
+        raw = zf.read(member)
+    grid = np.frombuffer(raw, dtype=np.uint8)
+    n = math.isqrt(grid.size)  # 3601: SRTM-style node registration
+    grid = grid.reshape(n, n)
+    res = 1.0 / (n - 1)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(dest.suffix + f".part{os.getpid()}")
+    try:
+        with rasterio.open(
+                tmp, "w", driver="GTiff", width=n, height=n, count=1,
+                dtype="uint8", crs="EPSG:4326", compress="deflate",
+                transform=from_origin(lon0 - res / 2, lat0 + 1 + res / 2,
+                                      res, res)) as out:
+            out.write(grid, 1)
+        os.replace(tmp, dest)
+    finally:
+        tmp.unlink(missing_ok=True)
+    return dest
 
 
 ENSURE = {"GLO-30": ensure_glo30, "FABDEM": ensure_fabdem,
@@ -255,7 +438,11 @@ def _ensure_glo30_aux(kind, cache, lat0, lon0):
                     cache / "glo30" / "masks" / f"{stem}_{kind}.tif")
 
 
-ENSURE.update({k: functools.partial(_ensure_glo30_aux, k) for k in AUX_KINDS})
+ENSURE.update({k: functools.partial(_ensure_glo30_aux, k)
+               for k in ("EDM", "FLM", "HEM")})
+ENSURE.update({k: functools.partial(_ensure_alos_aux, k)
+               for k in ("MSK", "STK")})
+ENSURE["NUM"] = ensure_nasadem_num
 
 
 # ------------------------------------------------------- parallel tile fetch
@@ -311,7 +498,6 @@ def fetch_all_tiles(cache, points, workers, extra=(), radius=0):
 
 def sample(dataset, lat, lon, interpolation):
     """Elevation at (lat, lon) from an open rasterio dataset, or None."""
-    import numpy as np
     colf, rowf = ~dataset.transform * (lon, lat)
     fx, fy = colf - 0.5, rowf - 0.5  # pixel-center coordinates
     x0, y0 = math.floor(fx), math.floor(fy)
@@ -335,7 +521,6 @@ def max_in_dataset(dataset, lat, lon, radius):
     Returns (value, pixel_lat, pixel_lon) or None. Distances are haversine to
     pixel centers, so the search area is a true circle, not the bounding box.
     """
-    import numpy as np
     t = dataset.transform
     # Shift the query longitude into the tile's frame (antimeridian case)
     if lon - t.c > 180:
@@ -377,7 +562,6 @@ class TileSampler:
         self.datasets = {}  # path -> open dataset
 
     def _open(self, path):
-        import rasterio
         key = str(path)
         if key not in self.datasets:
             self.datasets[key] = rasterio.open(path)
@@ -423,19 +607,14 @@ class TileSampler:
             val += self.undulation(dem, plat, plon)
         return val, plat, plon
 
-    def mask_info(self, lat, lon):
-        """GLO-30 provenance at the point: [EDM label, FLM label, HEM str]."""
+    def provenance(self, dem, lat, lon):
+        """This DEM's provenance layer labels at the point (see PROVENANCE)."""
         out = []
-        for kind in AUX_KINDS:
+        for kind, _, fmt in PROVENANCE.get(dem, []):
             path = ENSURE[kind](self.cache, *tile_origin(lat, lon))
             v = (self._sample_path(path, lat, lon, "nearest")
                  if path is not None else None)
-            if kind == "HEM":
-                # HEM nodata is -32767 (may not be declared in the tif)
-                out.append("" if v is None or v < -32000 else f"{v:.2f}")
-            else:
-                legend = EDM_LEGEND if kind == "EDM" else FLM_LEGEND
-                out.append("" if v is None else legend.get(int(v), str(int(v))))
+            out.append("" if v is None else fmt(v))
         return out
 
     def close(self):
@@ -485,8 +664,14 @@ def main():
                          "of each point, plus its lat/long, searching "
                          "neighboring tiles as needed (default: 0 = sample "
                          "exactly at the point)")
+    ap.add_argument("--earthdata-token", metavar="TOKEN",
+                    help="Earthdata Login bearer token for the NASADEM NUM "
+                         f"layer (default: ${EARTHDATA_TOKEN_VAR} or "
+                         "urs.earthdata.nasa.gov in ~/.netrc)")
     args = ap.parse_args()
     radius = args.sampling_distance
+    if args.earthdata_token:  # env var so worker processes inherit it
+        os.environ[EARTHDATA_TOKEN_VAR] = args.earthdata_token
 
     cache = Path(args.cache_dir)
     out_path = args.output or str(Path(args.csv).with_suffix("")) + "_dem_elevations.csv"
@@ -513,14 +698,17 @@ def main():
                     header.append(h)
                     pair.append(len(header) - 1)
             pos_cols[dem] = tuple(pair)
-    mask_cols = []
+    prov_cols = {}  # dem -> column indices aligned with PROVENANCE[dem]
     if not args.no_masks:
-        for h in MASK_HEADERS:
-            if h.lower() in cols:
-                mask_cols.append(cols[h.lower()])
-            else:
-                header.append(h)
-                mask_cols.append(len(header) - 1)
+        for dem, specs in PROVENANCE.items():
+            cs = []
+            for _, h, _ in specs:
+                if h.lower() in cols:
+                    cs.append(cols[h.lower()])
+                else:
+                    header.append(h)
+                    cs.append(len(header) - 1)
+            prov_cols[dem] = cs
 
     data = []  # (row_index, lat, lon)
     for i in range(hdr_i + 1, len(rows)):
@@ -531,10 +719,17 @@ def main():
         data = data[:args.limit]
     print(f"{len(data)} points to process")
 
+    aux = ()
+    if not args.no_masks:
+        aux = list(AUX_KINDS)
+        if not have_earthdata_creds():
+            aux.remove("NUM")
+            print("note: no Earthdata credentials (set "
+                  f"${EARTHDATA_TOKEN_VAR} or add urs.earthdata.nasa.gov to "
+                  "~/.netrc); NASADEM NUM column will be blank",
+                  file=sys.stderr)
     failures = fetch_all_tiles(cache, [(la, lo) for _, la, lo in data],
-                               args.workers,
-                               extra=() if args.no_masks else AUX_KINDS,
-                               radius=radius)
+                               args.workers, extra=aux, radius=radius)
     if failures:
         print(f"warning: {len(failures)} tile downloads failed; "
               "their points will be left blank", file=sys.stderr)
@@ -557,7 +752,7 @@ def main():
 
         for n, (i, lat, lon) in enumerate(data, 1):
             row = rows[i]
-            mask_pt = (lat, lon)  # where to sample the GLO-30 masks
+            prov_pts = {}  # dem -> where to sample its provenance layers
             for dem in DEM_NAMES:
                 elev, pos = None, None
                 try:
@@ -566,8 +761,7 @@ def main():
                         if found:
                             elev, plat, plon = found
                             pos = (plat, plon)
-                            if dem == "GLO-30":
-                                mask_pt = pos
+                            prov_pts[dem] = pos
                     else:
                         elev = sampler.elevation(dem, lat, lon)
                 except Exception as e:
@@ -579,14 +773,15 @@ def main():
                     lat_col_o, lon_col_o = pos_cols[dem]
                     put(row, lat_col_o, f"{pos[0]:.6f}" if pos else "")
                     put(row, lon_col_o, f"{pos[1]:.6f}" if pos else "")
-            if mask_cols:
+            for dem, cs in prov_cols.items():
+                pt = prov_pts.get(dem, (lat, lon))
                 try:
-                    values = sampler.mask_info(*mask_pt)
+                    values = sampler.provenance(dem, *pt)
                 except Exception as e:
-                    print(f"row {i + 1} masks: {type(e).__name__}: {e}",
+                    print(f"row {i + 1} {dem} masks: {type(e).__name__}: {e}",
                           file=sys.stderr)
-                    values = ["", "", ""]
-                for col, v in zip(mask_cols, values):
+                    values = [""] * len(cs)
+                for col, v in zip(cs, values):
                     put(row, col, v)
             if n % 50 == 0 or n == len(data):
                 print(f"sampled {n}/{len(data)}", flush=True)
